@@ -309,7 +309,8 @@ static bool ProcessMspWrite(const uint8_t *data, const uint32_t size, CrsfPacket
 	if (data[2] == 0x30 && data[4] == 0x59) {
 		const uint8_t length = data[3];
 
-		if (map_config == 1 || map_config == 2) {
+		// The received payload must contain both frequency bytes before they can be read.
+		if (size >= 7 && (map_config == 1 || map_config == 2)) {
 			// Status = bit4=new frame, bit5,6=MSPv1
 			// MSP command 0x59 is MSP_SET_VTX_CONFIG
 			uint32_t frequency = (data[6] << 8) | data[5];
@@ -327,7 +328,8 @@ static bool ProcessMspWrite(const uint8_t *data, const uint32_t size, CrsfPacket
 			param_set_no_notification(int(px4::params::VTX_FREQUENCY), &frequency);
 		}
 
-		if (length > 2 && (map_config == 1 || map_config == 3)) {
+		// The declared MSP length does not guarantee received bytes; require power and pit-mode fields too.
+		if (size >= 9 && length > 2 && (map_config == 1 || map_config == 3)) {
 			const int32_t pit_mode = (data[8] || (data[7] == 0)) ? 1 : 0;
 			param_set_no_notification(int(px4::params::VTX_PIT_MODE), &pit_mode);
 			const int32_t power{pit_mode ? 0 : data[7] - 1};
