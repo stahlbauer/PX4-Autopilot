@@ -84,4 +84,29 @@ TEST_F(CrsfParserTest, UnsupportedTypeIsIgnoredAndParserRecovers)
 	EXPECT_EQ(CrsfParser_FreeQueueSize(), empty_queue_size);
 }
 
+TEST_F(CrsfParserTest, InitializationDiscardsPartialFrameState)
+{
+	const uint32_t empty_queue_size = CrsfParser_FreeQueueSize();
+	const std::vector<uint8_t> channel_frame = makeFrame(CRSF_CHANNEL_TYPE,
+			std::vector<uint8_t>(CRSF_CHANNEL_PAYLOAD_SIZE));
+
+	// A restart must accept a fresh stream while waiting for the type, payload, or CRC of a partial frame.
+	for (const size_t partial_size : {size_t{1}, size_t{3}, channel_frame.size() - 1}) {
+		SCOPED_TRACE(partial_size);
+		CrsfPacket_t packet{};
+		CrsfParserStatistics_t statistics{};
+		ASSERT_TRUE(CrsfParser_LoadBuffer(channel_frame.data(), partial_size));
+		ASSERT_FALSE(CrsfParser_TryParseCrsfPacket(&packet, &statistics));
+
+		CrsfParser_Init();
+		EXPECT_EQ(CrsfParser_FreeQueueSize(), empty_queue_size);
+		ASSERT_TRUE(CrsfParser_LoadBuffer(channel_frame.data(), channel_frame.size()));
+		ASSERT_TRUE(CrsfParser_TryParseCrsfPacket(&packet, &statistics));
+		EXPECT_EQ(packet.message_type, CRSF_MESSAGE_TYPE_RC_CHANNELS);
+		EXPECT_EQ(statistics.crcs_valid_known_packets, 1u);
+		EXPECT_EQ(statistics.crcs_invalid, 0u);
+		EXPECT_EQ(CrsfParser_FreeQueueSize(), empty_queue_size);
+	}
+}
+
 } // namespace

@@ -171,10 +171,16 @@ static CrsfPacketDescriptor_t *FindCrsfDescriptor(const uint8_t packet_type);
 
 void CrsfParser_Init(void)
 {
+	// Queue contents and parsing state belong to the same byte stream. Reset both so a partial frame
+	// cannot carry its payload length or descriptor into a newly initialized stream.
 	QueueBuffer_Init(&rx_queue, rx_queue_buffer, RX_QUEUE_BUFFER_SIZE);
 #ifdef CONFIG_RC_CRSF_INJECT
 	QueueBuffer_Init(&inject_queue, inject_queue_buffer, RX_QUEUE_BUFFER_SIZE);
 #endif
+	parser_state = PARSER_STATE_HEADER;
+	working_index = 0;
+	working_segment_size = HEADER_SIZE;
+	working_descriptor = nullptr;
 }
 
 static float ConstrainF(const float x, const float min, const float max)
