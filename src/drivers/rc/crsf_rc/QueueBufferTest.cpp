@@ -41,18 +41,18 @@
 TEST(QueueBufferTest, PeekHandlesWrappedIndex)
 {
 	std::array<uint8_t, 5> storage{};
-	crsf::QueueBuffer queue;
-	queue.initialize(storage.data(), storage.size());
+	QueueBuffer_t queue{};
+	QueueBuffer_Init(&queue, storage.data(), storage.size());
 
 	const std::array<uint8_t, 4> initial_data{1, 2, 3, 4};
-	ASSERT_TRUE(queue.append(initial_data.data(), initial_data.size()));
-	queue.dequeue(initial_data.size());
+	ASSERT_TRUE(QueueBuffer_AppendBuffer(&queue, initial_data.data(), initial_data.size()));
+	QueueBuffer_Dequeue(&queue, initial_data.size());
 
 	const std::array<uint8_t, 5> wrapped_data{5, 6, 7, 8, 9};
-	ASSERT_TRUE(queue.append(wrapped_data.data(), wrapped_data.size()));
+	ASSERT_TRUE(QueueBuffer_AppendBuffer(&queue, wrapped_data.data(), wrapped_data.size()));
 
 	std::array<uint8_t, 2> result{};
-	ASSERT_TRUE(queue.peek(2, result.data(), result.size()));
+	ASSERT_TRUE(QueueBuffer_PeekBuffer(&queue, 2, result.data(), result.size()));
 	EXPECT_EQ(result[0], 7);
 	EXPECT_EQ(result[1], 8);
 }
@@ -60,10 +60,10 @@ TEST(QueueBufferTest, PeekHandlesWrappedIndex)
 TEST(QueueBufferTest, AppendRejectsInsufficientSpace)
 {
 	std::array<uint8_t, 4> storage{};
-	crsf::QueueBuffer queue;
-	queue.initialize(storage.data(), storage.size());
+	QueueBuffer_t queue{};
+	QueueBuffer_Init(&queue, storage.data(), storage.size());
 
 	const std::array<uint8_t, 5> data{1, 2, 3, 4, 5};
-	EXPECT_FALSE(queue.append(data.data(), data.size()));
-	EXPECT_TRUE(queue.empty());
+	EXPECT_FALSE(QueueBuffer_AppendBuffer(&queue, data.data(), data.size()));
+	EXPECT_TRUE(QueueBuffer_IsEmpty(&queue));
 }

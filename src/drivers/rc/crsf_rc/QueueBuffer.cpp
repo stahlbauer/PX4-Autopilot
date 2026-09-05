@@ -77,8 +77,8 @@ bool QueueBuffer_AppendBuffer(QueueBuffer_t *const q, const uint8_t *x, const ui
 
 	buffer_end_size = q->buffer_size - q->tail;
 
-	// Check if we can even put this buffer into the queu
-	if (q->count + append_size > q->buffer_size) {
+	// Accept the entire input only when it fits; subtraction keeps the capacity check overflow-safe.
+	if (append_size > q->buffer_size - q->count) {
 		return false;
 	}
 
@@ -141,12 +141,13 @@ bool QueueBuffer_PeekBuffer(const QueueBuffer_t *q, const uint32_t index, uint8_
 {
 	uint32_t copy_start;
 
-	copy_start = q->head + index;
-
-	// Check to see if this amount of sizegth exists at the index
-	if (index + size > q->count) {
+	// Validate the requested range using subtraction so index + size cannot overflow the check.
+	if (index > q->count || size > q->count - index) {
 		return false;
 	}
+
+	// Wrap the logical index so the copy starts within storage and the contiguous length cannot underflow.
+	copy_start = (q->head + index) % q->buffer_size;
 
 	// Check if we can do this in a single shot
 	if (copy_start + size <= q->buffer_size) {

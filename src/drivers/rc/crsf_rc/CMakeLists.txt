@@ -63,3 +63,9 @@ px4_add_unit_gtest(
 		QueueBuffer.cpp
 		Crc8.cpp
 	)
+
+px4_add_unit_gtest(
+	SRC QueueBufferTest.cpp
+	EXTRA_SRCS
+		QueueBuffer.cpp
+	)
