@@ -160,7 +160,8 @@ void CrsfRc::Run()
 
 		if (_uart == nullptr) {
 			PX4_ERR("Error creating serial device %s", _device);
-			px4_sleep(1);
+			// Retry initialization without blocking other drivers on this work queue.
+			ScheduleDelayed(1_s);
 			return;
 		}
 	}
@@ -170,14 +171,16 @@ void CrsfRc::Run()
 		// Otherwise the default baudrate will be used.
 		if (! _uart->setBaudrate(CRSF_BAUDRATE)) {
 			PX4_ERR("Error setting baudrate to %u on %s", CRSF_BAUDRATE, _device);
-			px4_sleep(1);
+			// Schedule another attempt so a setup failure cannot leave this work item unscheduled.
+			ScheduleDelayed(1_s);
 			return;
 		}
 
 		// Open the UART. If this is successful then the UART is ready to use.
 		if (! _uart->open()) {
 			PX4_ERR("Error opening serial device  %s", _device);
-			px4_sleep(1);
+			// Retry opening the port while allowing other work-queue users to keep running.
+			ScheduleDelayed(1_s);
 			return;
 		}
 
@@ -212,12 +215,9 @@ void CrsfRc::Run()
 	const hrt_abstime time_now_us = hrt_absolute_time();
 	perf_count_interval(_cycle_interval_perf, time_now_us);
 
-	if (_vehicle_status_sub.updated()) {
-		vehicle_status_s vehicle_status;
-
-		if (_vehicle_status_sub.copy(&vehicle_status)) {
-			_armed = (vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_ARMED);
-		}
+	// Reading consumes the subscription update. Cache the sample so arming checks cannot starve flight-mode telemetry.
+	if (_vehicle_status_sub.update(&_vehicle_status)) {
+		_armed = (_vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_ARMED);
 	}
 
 	vehicle_command_s vcmd{};
@@ -280,8 +280,9 @@ void CrsfRc::Run()
 							      new_crsf_packet.link_statistics.uplink_rssi_1);
 
 				if (time_now_us - _last_stats_tx_seen > 500_ms) {
-					// We haven't received link statistics tx in a while, use an approximation
-					_input_rc.rssi = (1.f - _input_rc.rssi_dbm / -130.f) * _input_rc.RSSI_MAX;
+					// Keep the fallback within input_rc's RSSI range; signals below -130 dBm must not produce negative RSSI.
+					const float rssi = (1.f - _input_rc.rssi_dbm / -130.f) * _input_rc.RSSI_MAX;
+					_input_rc.rssi = lroundf(math::constrain(rssi, 0.f, static_cast<float>(input_rc_s::RSSI_MAX)));
 				}
 
 				_input_rc.link_quality = new_crsf_packet.link_statistics.uplink_link_quality;
@@ -306,8 +307,9 @@ void CrsfRc::Run()
 			}
 		}
 
+		// Schedule telemetry from the current cycle time so a stale RC publication timestamp cannot delay it.
 		if (_param_rc_crsf_tel_en.get() && !_is_singlewire
-		    && (_input_rc.timestamp > _telemetry_update_last + 100_ms)) {
+		    && (time_now_us > _telemetry_update_last + 100_ms)) {
 			switch (_next_type) {
 			case 0:
 				battery_status_s battery_status;
@@ -330,7 +332,10 @@ void CrsfRc::Run()
 					int32_t longitude = static_cast<int32_t>(round(sensor_gps.longitude_deg * 1e7));
 					uint16_t groundspeed = sensor_gps.vel_m_s * 3.6f * 10.f;   // 0.1 km/h
 					uint16_t gps_heading = math::degrees(matrix::wrap_2pi(sensor_gps.cog_rad)) * 100.f;
-					uint16_t altitude = static_cast<int16_t>(sensor_gps.altitude_msl_m) + 1000;   // meters + 1000 offset
+					// Apply the offset before narrowing and saturate to the wire range so extreme altitudes cannot wrap.
+					// https://github.com/tbs-fpv/tbs-crsf-spec/blob/main/crsf.md#0x02-gps
+					const int32_t altitude_offset = lroundf(sensor_gps.altitude_msl_m) + 1000;
+					uint16_t altitude = static_cast<uint16_t>(math::constrain(altitude_offset, 0, UINT16_MAX));
 					uint8_t num_satellites = sensor_gps.satellites_used;
 					this->SendTelemetryGps(latitude, longitude, groundspeed, gps_heading, altitude, num_satellites);
 				}
@@ -351,12 +356,13 @@ void CrsfRc::Run()
 				break;
 
 			case 3:
-				vehicle_status_s vehicle_status;
 
-				if (_vehicle_status_sub.update(&vehicle_status)) {
+				// Require a received status sample: zero-initialized nav_state also means MANUAL and must not
+				// be advertised as an observed flight mode before the vehicle status is known.
+				if (_vehicle_status.timestamp != 0) {
 					const char *flight_mode = "(unknown)";
 
-					switch (vehicle_status.nav_state) {
+					switch (_vehicle_status.nav_state) {
 					case vehicle_status_s::NAVIGATION_STATE_MANUAL:
 						flight_mode = "Manual";
 						break;
@@ -370,7 +376,7 @@ void CrsfRc::Run()
 						break;
 
 					case vehicle_status_s::NAVIGATION_STATE_POSCTL:
-						flight_mode = (vehicle_status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_FIXED_WING) ? "Cruise" : "Position";
+						flight_mode = (_vehicle_status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_FIXED_WING) ? "Cruise" : "Position";
 						break;
 
 					case vehicle_status_s::NAVIGATION_STATE_AUTO_RTL:
@@ -438,7 +444,7 @@ void CrsfRc::Run()
 				break;
 			}
 
-			_telemetry_update_last = _input_rc.timestamp;
+			_telemetry_update_last = time_now_us;
 			_next_type = (_next_type + 1) % num_data_types;
 		}
 	}
@@ -539,10 +545,13 @@ bool CrsfRc::SendTelemetryBattery(const uint16_t voltage, const uint16_t current
 	WriteFrameHeader(buf, offset, crsf_frame_type_t::battery_sensor, (uint8_t)crsf_payload_size_t::battery_sensor);
 	write_uint16_t(buf, offset, voltage);
 	write_uint16_t(buf, offset, current);
-	write_uint24_t(buf, offset, fuel);
+	// Consumed capacity is unsigned and 24 bits wide; saturate so negative or oversized values cannot wrap.
+	// https://github.com/tbs-fpv/tbs-crsf-spec/blob/main/crsf.md#0x08-battery-sensor
+	write_uint24_t(buf, offset, math::constrain(fuel, 0, 0xFFFFFF));
 	write_uint8_t(buf, offset, remaining);
 	WriteFrameCrc(buf, offset, sizeof(buf));
-	return _uart->write((void *) buf, (size_t) offset);
+	// A UART error or partial write does not complete a frame; require the full byte count for success.
+	return _uart->write((void *) buf, (size_t) offset) == static_cast<ssize_t>(offset);
 
 }
 
@@ -559,7 +568,8 @@ bool CrsfRc::SendTelemetryGps(const int32_t latitude, const int32_t longitude, c
 	write_uint16_t(buf, offset, altitude);
 	write_uint8_t(buf, offset, num_satellites);
 	WriteFrameCrc(buf, offset, sizeof(buf));
-	return _uart->write((void *) buf, (size_t) offset);
+	// A UART error or partial write does not complete a frame; require the full byte count for success.
+	return _uart->write((void *) buf, (size_t) offset) == static_cast<ssize_t>(offset);
 }
 
 bool CrsfRc::SendTelemetryAttitude(const int16_t pitch, const int16_t roll, const int16_t yaw)
@@ -571,7 +581,8 @@ bool CrsfRc::SendTelemetryAttitude(const int16_t pitch, const int16_t roll, cons
 	write_uint16_t(buf, offset, roll);
 	write_uint16_t(buf, offset, yaw);
 	WriteFrameCrc(buf, offset, sizeof(buf));
-	return _uart->write((void *) buf, (size_t) offset);
+	// A UART error or partial write does not complete a frame; require the full byte count for success.
+	return _uart->write((void *) buf, (size_t) offset) == static_cast<ssize_t>(offset);
 }
 
 bool CrsfRc::SendTelemetryBaroAltitude(const uint16_t altitude, const int16_t vertical_speed)
@@ -582,7 +593,8 @@ bool CrsfRc::SendTelemetryBaroAltitude(const uint16_t altitude, const int16_t ve
 	write_uint16_t(buf, offset, altitude);
 	write_uint16_t(buf, offset, (uint16_t)vertical_speed);
 	WriteFrameCrc(buf, offset, sizeof(buf));
-	return _uart->write((void *) buf, (size_t) offset);
+	// A UART error or partial write does not complete a frame; require the full byte count for success.
+	return _uart->write((void *) buf, (size_t) offset) == static_cast<ssize_t>(offset);
 }
 
 bool CrsfRc::SendTelemetryFlightMode(const char *flight_mode)
@@ -601,7 +613,8 @@ bool CrsfRc::SendTelemetryFlightMode(const char *flight_mode)
 	offset += length;
 	buf[offset - 1] = 0; // ensure null-terminated string
 	WriteFrameCrc(buf, offset, length + 4);
-	return _uart->write((void *) buf, (size_t) offset);
+	// A UART error or partial write does not complete a frame; require the full byte count for success.
+	return _uart->write((void *) buf, (size_t) offset) == static_cast<ssize_t>(offset);
 }
 
 bool CrsfRc::BindCRSF()
@@ -650,6 +663,11 @@ int CrsfRc::print_status()
 
 int CrsfRc::custom_command(int argc, char *argv[])
 {
+	// Reject an absent command before string comparisons, which require a valid command string.
+	if (argc < 1 || argv[0] == nullptr) {
+		return print_usage("missing command");
+	}
+
 	if (!strcmp(argv[0], "bind")) {
 		uORB::Publication<vehicle_command_s> vehicle_command_pub{ORB_ID(vehicle_command)};
 		vehicle_command_s vcmd{};
@@ -672,6 +690,9 @@ int CrsfRc::custom_command(int argc, char *argv[])
 		if (ret) {
 			return ret;
 		}
+
+		// Complete dispatch here so a successful start cannot reach the unknown-command result.
+		return PX4_OK;
 	}
 
 	if (!is_running(desc)) {
@@ -680,18 +701,38 @@ int CrsfRc::custom_command(int argc, char *argv[])
 
 	// crsf_rc inject 0x7C 0xC8 0xEA 0x30 0x02 0x59 0x31 0x00 0x6A
 	if (!strcmp(argv[0], "inject")) {
-		const uint8_t length = argc;
 		uint8_t buf[100];
+
+		// Require a type byte and reserve sync, length, and CRC storage so arguments cannot overrun the buffer.
+		if (argc < 2 || argc > static_cast<int>(sizeof(buf)) - 2) {
+			return print_usage("inject requires between 1 and 97 data bytes");
+		}
+
+		const uint8_t length = argc;
 		buf[0] = 0xC8; // sync byte
 		buf[1] = length;
 		uint8_t i = 0;
 
 		for (; i < length - 1; i++) {
-			buf[i + 2] = (uint8_t) strtol(argv[i + 1], nullptr, 16);
+			char *end = nullptr;
+			const unsigned long value = strtoul(argv[i + 1], &end, 16);
+
+			// Require a complete hexadecimal byte so partial parsing or narrowing cannot silently change frame data.
+			if (end == argv[i + 1] || *end != '\0' || value > UINT8_MAX) {
+				return print_usage("inject data must be hexadecimal bytes");
+			}
+
+			buf[i + 2] = static_cast<uint8_t>(value);
 		}
 
 		buf[i + 2] = Crc8Calc(buf + 2, length - 1); // CRC
-		CrsfParser_InjectBuffer(buf, length + 2);
+
+		// Propagate rejection so the command cannot report success for a frame that was never queued.
+		if (!CrsfParser_InjectBuffer(buf, length + 2)) {
+			PX4_ERR("insufficient parser queue space");
+			return PX4_ERROR;
+		}
+
 		return PX4_OK;
 	}
 
